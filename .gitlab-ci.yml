@@ -1,0 +1,4 @@
+include:
+  - project: levenlabs/infrastructure/gitlab-ci
+    file:
+      - base.yml

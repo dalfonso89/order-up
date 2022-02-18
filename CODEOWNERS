@@ -1,0 +1,3 @@
+* @levenlabs/go-owners
+go.mod @levenlabs/deps-owners
+go.sum @levenlabs/deps-owners
