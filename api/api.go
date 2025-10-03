@@ -42,12 +42,17 @@ func Handler(stor mocks.StorageInstance, fulfillmentService, chargeService *http
 		chargeService:      chargeService,
 	}
 
+	// Add logging middleware to all routes
+	inst.router.Use(inst.loggingMiddleware())
+
 	// set up the various REST endpoints that are exposed publicly over HTTP
 	// go implicitly binds these functions to inst
 	inst.router.GET("/orders", inst.getOrders)
 	inst.router.POST("/orders", inst.postOrders)
-	inst.router.GET("/orders/:id", inst.getOrder)
-	inst.router.POST("/orders/:id/charge", inst.chargeOrder)
+
+	// Use order fetch middleware for routes that need to fetch an order
+	inst.router.GET("/orders/:id", inst.orderFetchMiddleware(), inst.getOrder)
+	inst.router.POST("/orders/:id/charge", inst.orderFetchMiddleware(), inst.chargeOrder)
 
 	// *instance implements the http.Handler interface with the ServeHTTP method
 	// below so we can just return inst
@@ -92,6 +97,57 @@ func (i *instance) handleError(c *gin.Context, statusCode int, code, message str
 		Code:    code,
 		Message: message,
 	})
+}
+
+// Middleware for centralized logging
+func (i *instance) loggingMiddleware() gin.HandlerFunc {
+	return gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("[%s] %s %s %d %s %s\n",
+			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+			param.Method,
+			param.Path,
+			param.StatusCode,
+			param.Latency,
+			param.ClientIP,
+		)
+	})
+}
+
+// Middleware for handling order fetching with centralized error handling
+func (i *instance) orderFetchMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+
+		// Get order ID from URL parameter
+		id := c.Param("id")
+		if id == "" {
+			i.handleError(c, http.StatusBadRequest, ErrCodeInvalidStatus, "missing order ID")
+			c.Abort()
+			return
+		}
+
+		// Fetch order from storage
+		order, err := i.stor.GetOrder(ctx, id)
+		if err != nil {
+			if errors.Is(err, storage.ErrOrderNotFound) {
+				i.handleError(c, http.StatusNotFound, ErrCodeOrderNotFound, "not found")
+			} else {
+				i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting order: %v", err))
+			}
+			c.Abort()
+			return
+		}
+
+		// Store order in context for use by handlers
+		c.Set("order", order)
+		c.Next()
+	}
+}
+
+// Helper function to get order from context (set by middleware)
+func (i *instance) getOrderFromContext(c *gin.Context) storage.Order {
+	order, _ := c.Get("order")
+	return order.(storage.Order)
 }
 
 // getOrders is called by incoming HTTP GET requests to /orders
@@ -154,24 +210,8 @@ type getOrderRes struct {
 
 // getOrder is called by incoming HTTP GET requests to /orders/:id
 func (i *instance) getOrder(c *gin.Context) {
-	// the context of the request we pass along to every downstream function so we
-	// can stop processing if the caller aborts the request and also to ensure that
-	// the tracing context is kept throughout the whole request
-	ctx := c.Request.Context()
-
-	// since the path includes a param :id we can get the value for that by calling
-	// the Param function
-	id := c.Param("id")
-
-	order, err := i.stor.GetOrder(ctx, id)
-	if err != nil {
-		if errors.Is(err, storage.ErrOrderNotFound) {
-			i.handleError(c, http.StatusNotFound, ErrCodeOrderNotFound, "not found")
-		} else {
-			i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting order: %v", err))
-		}
-		return
-	}
+	// Get order from context (set by middleware)
+	order := i.getOrderFromContext(c)
 
 	// respond with a success and return the order
 	c.JSON(http.StatusOK, getOrderRes{
@@ -307,9 +347,6 @@ type chargeOrderRes struct {
 
 // chargeOrder is called by incoming HTTP POST requests to /orders/:id/charge
 func (i *instance) chargeOrder(c *gin.Context) {
-	// the context of the request we pass along to every downstream function so we
-	// can stop processing if the caller aborts the request and also to ensure that
-	// the tracing context is kept throughout the whole request
 	ctx := c.Request.Context()
 
 	// parse the body as JSON into the chargeOrderArgs struct
@@ -320,21 +357,9 @@ func (i *instance) chargeOrder(c *gin.Context) {
 		return
 	}
 
-	// since the path includes a param :id we can get the value for that by calling
-	// the Param function
-	id := c.Param("id")
+	// Get order from context (set by middleware)
+	order := i.getOrderFromContext(c)
 
-	// make a call to the storage instance to get the current state of the order
-	// so we can make sure that its ready for charging and get the amount to charge
-	order, err := i.stor.GetOrder(c.Request.Context(), id)
-	if err != nil {
-		if errors.Is(err, storage.ErrOrderNotFound) {
-			i.handleError(c, http.StatusNotFound, ErrCodeOrderNotFound, "not found")
-		} else {
-			i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting order: %v", err))
-		}
-		return
-	}
 	if order.Status != storage.OrderStatusPending {
 		i.handleError(c, http.StatusConflict, ErrCodeOrderNotEligible,
 			"order ineligible for charging")
