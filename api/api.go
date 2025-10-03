@@ -53,6 +53,7 @@ func Handler(stor mocks.StorageInstance, fulfillmentService, chargeService *http
 	// Use order fetch middleware for routes that need to fetch an order
 	inst.router.GET("/orders/:id", inst.orderFetchMiddleware(), inst.getOrder)
 	inst.router.POST("/orders/:id/charge", inst.orderFetchMiddleware(), inst.chargeOrder)
+	inst.router.POST("/orders/:id/cancel", inst.orderFetchMiddleware(), inst.cancelOrder)
 
 	// *instance implements the http.Handler interface with the ServeHTTP method
 	// below so we can just return inst
@@ -169,6 +170,8 @@ func (i *instance) getOrders(c *gin.Context) {
 		status = storage.OrderStatusCharged
 	case "fulfilled":
 		status = storage.OrderStatusFulfilled
+	case "cancelled":
+		status = storage.OrderStatusCancelled
 	case "":
 		// GetAllOrders accepts a -1 to indicate that all orders should be returned
 		status = -1
@@ -289,55 +292,22 @@ func (i *instance) postOrders(c *gin.Context) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// chargeServiceChargeArgs is the expected body for the POST /charge method of
-// the charge service
-// we could use a map[string]interface{}{} or something else but this makes it
-// easier to use in tests and makes the API contract clear
-// we could also be importing something from the charge service instead if that
-// actually existed
+// chargeOrderArgs is the expected body for the POST /orders/:id/charge handler
+type chargeOrderArgs struct {
+	CardToken string `json:"cardToken"`
+}
+
+// chargeServiceChargeArgs is the expected body for the charge service
 type chargeServiceChargeArgs struct {
 	CardToken   string `json:"cardToken"`
 	AmountCents int64  `json:"amountCents"`
 }
 
-// innerChargeOrder actually does the charging or refunding (negative amount) by
-// making at POST request to the charge service
-func (i *instance) innerChargeOrder(ctx context.Context, args chargeServiceChargeArgs) error {
-	// encode the charge service's charge arguments as JSON so we can POST them to
-	// the /charge path on the charge service
-	// this method returns a byte slice that we can later pass to the Post message
-	// as the body of the POST request
-	// there's a package called "bytes" so we call the variable byts
-	byts, err := json.Marshal(args)
-	if err != nil {
-		return fmt.Errorf("error encoding charge body: %w", err)
-	}
-
-	// make a POST request to the /charge endpoint on the charge service
-	// the body is JSON but this method accepts a io.Reader so we need to wrap the
-	// byte slice in bytes.NewReader which simply reads over the sent byte slice
-	resp, err := i.chargeService.Post("/charge", "application/json", bytes.NewReader(byts))
-	if err != nil {
-		return fmt.Errorf("error making charge request: %w", err)
-	}
-	// we need to make sure we close the body otherwise this will leak memory
-	defer resp.Body.Close()
-	// /charge creates a new charge so we expect a 201 response, if we didn't get
-	// that then we must've errored
-	if resp.StatusCode != http.StatusCreated {
-		// we opportunistically try to read the body in case it contains an error but
-		// if it fails then that's not the end of the world so we ignore the error
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("error charging body: %d %s", resp.StatusCode, body)
-	}
-	return nil
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-// chargeOrderArgs is the expected body for the POST /orders/:id/charge handler
-type chargeOrderArgs struct {
-	CardToken string `json:"cardToken"`
+// fulfillmentServiceFulfillArgs is the expected body for the fulfillment service
+type fulfillmentServiceFulfillArgs struct {
+	Description string `json:"description"`
+	Quantity    int64  `json:"quantity"`
+	OrderID     string `json:"orderId"`
 }
 
 // chargeOrderRes is the result of the POST /orders/:id/charge handler
@@ -395,18 +365,97 @@ func (i *instance) chargeOrder(c *gin.Context) {
 	})
 }
 
-////////////////////////////////////////////////////////////////////////////////
+// innerChargeOrder actually does the charging or refunding (negative amount) by
+// making at POST request to the charge service
+func (i *instance) innerChargeOrder(ctx context.Context, args chargeServiceChargeArgs) error {
+	// encode the charge service's charge arguments as JSON so we can POST them to
+	// the /charge path on the charge service
+	// this method returns a byte slice that we can later pass to the Post message
+	// as the body of the POST request
+	// there's a package called "bytes" so we call the variable byts
+	byts, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Errorf("error encoding charge body: %w", err)
+	}
 
-// TODO: cancel args, res, function
-
-////////////////////////////////////////////////////////////////////////////////
-
-// fulfillmentServiceFulfillArgs are the arguments for the PUT /fulfill endpoint
-// exposed by the fulfillment service
-type fulfillmentServiceFulfillArgs struct {
-	Description string `json:"description"`
-	Quantity    int64  `json:"quantity"`
-	OrderID     string `json:"orderID"`
+	// make a POST request to the /charge endpoint on the charge service
+	// the body is JSON but this method accepts a io.Reader so we need to wrap the
+	// byte slice in bytes.NewReader which simply reads over the sent byte slice
+	resp, err := i.chargeService.Post("/charge", "application/json", bytes.NewReader(byts))
+	if err != nil {
+		return fmt.Errorf("error making charge request: %w", err)
+	}
+	// we need to make sure we close the body otherwise this will leak memory
+	defer resp.Body.Close()
+	// /charge creates a new charge so we expect a 201 response, if we didn't get
+	// that then we must've errored
+	if resp.StatusCode != http.StatusCreated {
+		// we opportunistically try to read the body in case it contains an error but
+		// if it fails then that's not the end of the world so we ignore the error
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("error charging body: %d %s", resp.StatusCode, body)
+	}
+	return nil
 }
 
-// TODO: fulfill args, res, function
+////////////////////////////////////////////////////////////////////////////////
+
+// cancelOrderRes is the result of the POST /orders/:id/cancel handler
+type cancelOrderRes struct {
+	Message       string `json:"message"`
+	OrderID       string `json:"orderId"`
+	RefundedCents int64  `json:"refundedCents,omitempty"`
+}
+
+// cancelOrder is called by incoming HTTP POST requests to /orders/:id/cancel
+func (i *instance) cancelOrder(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	// Get order from context (set by middleware)
+	order := i.getOrderFromContext(c)
+
+	// Check if order can be cancelled (pending or charged orders can be cancelled)
+	if order.Status != storage.OrderStatusPending && order.Status != storage.OrderStatusCharged {
+		i.handleError(c, http.StatusConflict, ErrCodeOrderNotEligible,
+			"order cannot be cancelled - only pending or charged orders can be cancelled")
+		return
+	}
+
+	var refundedCents int64 = 0
+
+	// If the order is charged, we need to process a refund
+	if order.Status == storage.OrderStatusCharged {
+		// Process refund by charging a negative amount
+		err := i.innerChargeOrder(ctx, chargeServiceChargeArgs{
+			CardToken:   "",                  // In a real implementation, we'd need to store the card token
+			AmountCents: -order.TotalCents(), // Negative amount for refund
+		})
+		if err != nil {
+			i.handleError(c, http.StatusInternalServerError, ErrCodeChargeServiceError,
+				fmt.Sprintf("error processing refund: %v", err))
+			return
+		}
+		refundedCents = order.TotalCents()
+	}
+
+	// Update order status to cancelled
+	err := i.stor.SetOrderStatus(ctx, order.ID, storage.OrderStatusCancelled)
+	if err != nil {
+		i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError,
+			fmt.Sprintf("error cancelling order: %v", err))
+		return
+	}
+
+	// Return success response
+	response := cancelOrderRes{
+		Message: "order cancelled successfully",
+		OrderID: order.ID,
+	}
+
+	// Include refund amount if applicable
+	if refundedCents > 0 {
+		response.RefundedCents = refundedCents
+	}
+
+	c.JSON(http.StatusOK, response)
+}
