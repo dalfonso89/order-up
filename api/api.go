@@ -66,6 +66,34 @@ type getOrdersRes struct {
 	Orders []storage.Order `json:"orders"`
 }
 
+type errorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// Error codes for different types of errors
+const (
+	ErrCodeOrderNotFound      = "order_not_found"
+	ErrCodeOrderExists        = "order_already_exists"
+	ErrCodeInvalidEmail       = "invalid_email"
+	ErrCodeInvalidLineItems   = "invalid_line_items"
+	ErrCodeInvalidTotal       = "invalid_total"
+	ErrCodeInvalidStatus      = "invalid_status"
+	ErrCodeOrderNotCharged    = "order_not_charged"
+	ErrCodeOrderNotEligible   = "order_not_eligible"
+	ErrCodeInvalidJSON        = "invalid_json"
+	ErrCodeInternalError      = "internal_error"
+	ErrCodeChargeServiceError = "charge_service_error"
+)
+
+// Helper functions for creating structured errors
+func (i *instance) handleError(c *gin.Context, statusCode int, code, message string) {
+	c.JSON(statusCode, errorResponse{
+		Code:    code,
+		Message: message,
+	})
+}
+
 // getOrders is called by incoming HTTP GET requests to /orders
 func (i *instance) getOrders(c *gin.Context) {
 	// the context of the request we pass along to every downstream function so we
@@ -89,7 +117,7 @@ func (i *instance) getOrders(c *gin.Context) {
 		// GetAllOrders accepts a -1 to indicate that all orders should be returned
 		status = -1
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown value for status: %v"})
+		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidStatus, "unknown value for status: %v")
 		return
 	}
 
@@ -97,7 +125,7 @@ func (i *instance) getOrders(c *gin.Context) {
 	// instance
 	orders, err := i.stor.GetOrders(ctx, status)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error getting orders: %v", err)})
+		i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting orders: %v", err))
 		return
 	}
 
@@ -137,12 +165,10 @@ func (i *instance) getOrder(c *gin.Context) {
 
 	order, err := i.stor.GetOrder(ctx, id)
 	if err != nil {
-		// if the error is a ErrOrderNotFound error then we return 404 otherwise we
-		// return a 500 error
 		if errors.Is(err, storage.ErrOrderNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			i.handleError(c, http.StatusNotFound, ErrCodeOrderNotFound, "not found")
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error getting order: %v", err)})
+			i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting order: %v", err))
 		}
 		return
 	}
@@ -177,7 +203,7 @@ func (i *instance) postOrders(c *gin.Context) {
 	var args postOrderArgs
 	err := c.BindJSON(&args)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("error decoding body: %v", err)})
+		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidJSON, fmt.Sprintf("error decoding body: %v", err))
 		return
 	}
 
@@ -186,11 +212,11 @@ func (i *instance) postOrders(c *gin.Context) {
 	// so we could set struct tags but since we only do validation in this one
 	// spot that feels like overkill
 	if !strings.Contains(args.CustomerEmail, "@") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid customerEmail"})
+		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidEmail, "invalid customerEmail")
 		return
 	}
 	if len(args.LineItems) < 1 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "an order must contain at least one line item"})
+		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidLineItems, "an order must contain at least one line item")
 		return
 	}
 
@@ -200,17 +226,16 @@ func (i *instance) postOrders(c *gin.Context) {
 		Status:        storage.OrderStatusPending,
 	}
 	if order.TotalCents() < 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "an order's total cannot be less than 0"})
+		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidTotal, "an order's total cannot be less than 0")
+		return
 	}
 
 	id, err := i.stor.InsertOrder(ctx, order)
 	if err != nil {
-		// if the error is a ErrOrderExists error then we return 409 otherwise we
-		// return a 500 error
 		if errors.Is(err, storage.ErrOrderExists) {
-			c.JSON(http.StatusConflict, gin.H{"error": "order already exists"})
+			i.handleError(c, http.StatusConflict, ErrCodeOrderExists, "order already exists")
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error inserting order: %v", err)})
+			i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error inserting order: %v", err))
 		}
 		return
 	}
@@ -291,7 +316,7 @@ func (i *instance) chargeOrder(c *gin.Context) {
 	var args chargeOrderArgs
 	err := c.BindJSON(&args)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("error decoding body: %v", err)})
+		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidJSON, fmt.Sprintf("error decoding body: %v", err))
 		return
 	}
 
@@ -304,14 +329,15 @@ func (i *instance) chargeOrder(c *gin.Context) {
 	order, err := i.stor.GetOrder(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, storage.ErrOrderNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			i.handleError(c, http.StatusNotFound, ErrCodeOrderNotFound, "not found")
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error getting order: %v", err)})
+			i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting order: %v", err))
 		}
 		return
 	}
-	if order.Status != storage.OrderStatusCharged {
-		c.JSON(http.StatusConflict, gin.H{"error": "order ineligible for charging"})
+	if order.Status != storage.OrderStatusPending {
+		i.handleError(c, http.StatusConflict, ErrCodeOrderNotEligible,
+			"order ineligible for charging")
 		return
 	}
 
@@ -320,7 +346,8 @@ func (i *instance) chargeOrder(c *gin.Context) {
 		AmountCents: order.TotalCents(),
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		i.handleError(c, http.StatusInternalServerError, ErrCodeChargeServiceError,
+			err.Error())
 		return
 	}
 
@@ -332,7 +359,7 @@ func (i *instance) chargeOrder(c *gin.Context) {
 	// ignoring this scenario
 	err = i.stor.SetOrderStatus(ctx, order.ID, storage.OrderStatusCharged)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error updating order to charged: %v", err)})
+		i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error updating order to charged: %v", err))
 		return
 	}
 
