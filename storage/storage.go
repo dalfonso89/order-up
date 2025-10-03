@@ -4,9 +4,11 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/levenlabs/go-llog"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Instance holds a database connection for use in the storage methods
@@ -18,7 +20,7 @@ type Instance struct {
 	// testing
 	database string
 	// this is where you'd store any database connections like a *mongo.Client or
-	// *sql.DB
+	db *sql.DB
 }
 
 func New(overrideDatabase string) *Instance {
@@ -34,8 +36,14 @@ func New(overrideDatabase string) *Instance {
 		inst.database = "order_up"
 	}
 
-	// TODO: code for connecting to the database and storing the connected driver
+	// code for connecting to the database and storing the connected driver
 	// instance on inst
+	dbPath := inst.database + ".db"
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		llog.Fatal("failed to open database", llog.ErrKV(err))
+	}
+	inst.db = db
 
 	// give the ensureSchema function only 15 seconds to complete
 	// after 15 seconds the context will return DeadlineExceeded errors which should
@@ -58,5 +66,19 @@ func (i *Instance) ensureSchema(ctx context.Context) error {
 	// starts or every time you run tests, it should not fail if the schema is
 	// already setup
 	// for example you might need to add a unique index on the order's ID field ;)
+
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS orders (
+		id TEXT PRIMARY KEY,
+		customer_email TEXT NOT NULL,
+		line_items TEXT NOT NULL,
+		status INTEGER NOT NULL
+	)`
+
+	_, err := i.db.ExecContext(ctx, createTableSQL)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
