@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/levenlabs/go-llog"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
 // Instance holds a database connection for use in the storage methods
@@ -39,7 +39,7 @@ func New(overrideDatabase string) *Instance {
 	// code for connecting to the database and storing the connected driver
 	// instance on inst
 	dbPath := inst.database + ".db"
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		llog.Fatal("failed to open database", llog.ErrKV(err))
 	}

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+
+	"github.com/google/uuid"
 )
 
 var (
@@ -109,6 +111,25 @@ func (i *Instance) GetOrders(ctx context.Context, status OrderStatus) ([]Order, 
 // be returned.
 func (i *Instance) SetOrderStatus(ctx context.Context, id string, status OrderStatus) error {
 	// TODO: update the order's status field to status for the id
+
+	// Update the order's status field to status for the id
+	query := `UPDATE orders SET status = ? WHERE id = ?`
+
+	result, err := i.db.ExecContext(ctx, query, status, id)
+
+	if err != nil {
+		return err
+	}
+
+	// Check if any rows were affected
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrOrderNotFound
+	}
+
 	return nil
 }
 
@@ -120,5 +141,31 @@ func (i *Instance) SetOrderStatus(ctx context.Context, id string, status OrderSt
 func (i *Instance) InsertOrder(ctx context.Context, order Order) (string, error) {
 	// TODO: if the order's ID field is empty, generate a random ID, then insert
 	// into the database
-	return "", errors.New("unimplemented")
+
+	// Generate a random ID if the order's ID field is empty
+	if order.ID == "" {
+		order.ID = uuid.New().String()
+	}
+
+	// Check if order already exists
+	_, err := i.GetOrder(ctx, order.ID)
+	if err == nil {
+		// Order already exists
+		return "", ErrOrderExists
+	}
+
+	// Insert the order into the database
+	query := `INSERT INTO orders (id, customer_email, line_items, status) VALUES (?, ?, ?, ?)`
+
+	orderLineItemsJSON, err := json.Marshal(order.LineItems)
+	if err != nil {
+		return order.ID, err
+	}
+
+	_, err = i.db.ExecContext(ctx, query, order.ID, order.CustomerEmail, orderLineItemsJSON, order.Status)
+	if err != nil {
+		return order.ID, err
+	}
+
+	return order.ID, nil
 }
