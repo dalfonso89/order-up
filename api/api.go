@@ -11,8 +11,10 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/levenlabs/go-llog"
 	"github.com/levenlabs/order-up/mocks"
 	"github.com/levenlabs/order-up/storage"
 )
@@ -102,17 +104,42 @@ func (i *instance) handleError(c *gin.Context, statusCode int, code, message str
 }
 
 // Middleware for centralized logging
+// loggingMiddleware provides structured logging using llog for all requests
 func (i *instance) loggingMiddleware() gin.HandlerFunc {
-	return gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
-		return fmt.Sprintf("[%s] %s %s %d %s %s\n",
-			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
-			param.Method,
-			param.Path,
-			param.StatusCode,
-			param.Latency,
-			param.ClientIP,
-		)
-	})
+	return func(c *gin.Context) {
+		start := time.Now()
+
+		// Process request
+		c.Next()
+
+		// Calculate duration
+		duration := time.Since(start)
+
+		// Extract order ID if present in path
+		orderID := c.Param("id")
+
+		// Create structured log entry with key-value pairs
+		kv := llog.KV{
+			"method":      c.Request.Method,
+			"path":        c.Request.URL.Path,
+			"status_code": c.Writer.Status(),
+			"duration_ms": duration.Milliseconds(),
+			"client_ip":   c.ClientIP(),
+			"user_agent":  c.Request.UserAgent(),
+		}
+
+		// Add order ID if present
+		if orderID != "" {
+			kv["order_id"] = orderID
+		}
+
+		// Log based on status code
+		if c.Writer.Status() >= 400 {
+			llog.Error("request completed with error", kv)
+		} else {
+			llog.Info("request completed successfully", kv)
+		}
+	}
 }
 
 // Middleware for handling order fetching with centralized error handling
@@ -154,11 +181,17 @@ func (i *instance) getOrderFromContext(c *gin.Context) storage.Order {
 
 // healthCheck is called by incoming HTTP GET requests to /healthz
 func (i *instance) healthCheck(c *gin.Context) {
+	llog.Info("health check requested", llog.KV{"handler": "healthCheck"})
+
 	c.Status(http.StatusOK)
+
+	llog.Info("health check completed successfully", llog.KV{"handler": "healthCheck"})
 }
 
 // getOrders is called by incoming HTTP GET requests to /orders
 func (i *instance) getOrders(c *gin.Context) {
+	llog.Info("get orders request started", llog.KV{"handler": "getOrders"})
+
 	// the context of the request we pass along to every downstream function so we
 	// can stop processing if the caller aborts the request and also to ensure that
 	// the tracing context is kept throughout the whole request
@@ -168,7 +201,8 @@ func (i *instance) getOrders(c *gin.Context) {
 	// this lets you do /orders?status=pending to limit the orders to only those that
 	// are currently pending
 	var status storage.OrderStatus
-	switch c.Query("status") {
+	statusStr := c.Query("status")
+	switch statusStr {
 	case "pending":
 		status = storage.OrderStatusPending
 		// the final break is implied if there's no fallthrough keyword
@@ -182,14 +216,22 @@ func (i *instance) getOrders(c *gin.Context) {
 		// GetAllOrders accepts a -1 to indicate that all orders should be returned
 		status = -1
 	default:
+		llog.Error("invalid status parameter", llog.KV{"handler": "getOrders", "status": statusStr})
 		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidStatus, "unknown value for status: %v")
 		return
 	}
+
+	llog.Info("fetching orders from storage", llog.KV{
+		"handler":       "getOrders",
+		"status_filter": statusStr,
+		"status_code":   int(status),
+	})
 
 	// pass along the status and get all of the resulting orders from the storage
 	// instance
 	orders, err := i.stor.GetOrders(ctx, status)
 	if err != nil {
+		llog.Error("failed to get orders from storage", llog.KV{"handler": "getOrders"}, llog.ErrKV(err))
 		i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error getting orders: %v", err))
 		return
 	}
@@ -201,10 +243,17 @@ func (i *instance) getOrders(c *gin.Context) {
 		orders = []storage.Order{}
 	}
 
+	llog.Info("successfully retrieved orders from storage", llog.KV{
+		"handler":     "getOrders",
+		"order_count": len(orders),
+	})
+
 	// respond with a success and return the orders
 	c.JSON(http.StatusOK, getOrdersRes{
 		Orders: orders,
 	})
+
+	llog.Info("get orders request completed successfully", llog.KV{"handler": "getOrders"})
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -219,13 +268,23 @@ type getOrderRes struct {
 
 // getOrder is called by incoming HTTP GET requests to /orders/:id
 func (i *instance) getOrder(c *gin.Context) {
+	llog.Info("get order request started", llog.KV{"handler": "getOrder"})
+
 	// Get order from context (set by middleware)
 	order := i.getOrderFromContext(c)
+
+	llog.Info("retrieved order from context", llog.KV{
+		"handler":      "getOrder",
+		"order_id":     order.ID,
+		"order_status": int(order.Status),
+	})
 
 	// respond with a success and return the order
 	c.JSON(http.StatusOK, getOrderRes{
 		Order: order,
 	})
+
+	llog.Info("get order request completed successfully", llog.KV{"handler": "getOrder"})
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -243,6 +302,8 @@ type postOrderRes struct {
 
 // postOrders is called by incoming HTTP POST requests to /orders
 func (i *instance) postOrders(c *gin.Context) {
+	llog.Info("post orders request started", llog.KV{"handler": "postOrders"})
+
 	// the context of the request we pass along to every downstream function so we
 	// can stop processing if the caller aborts the request and also to ensure that
 	// the tracing context is kept throughout the whole request
@@ -252,19 +313,28 @@ func (i *instance) postOrders(c *gin.Context) {
 	var args postOrderArgs
 	err := c.BindJSON(&args)
 	if err != nil {
+		llog.Error("failed to parse JSON body", llog.KV{"handler": "postOrders"}, llog.ErrKV(err))
 		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidJSON, fmt.Sprintf("error decoding body: %v", err))
 		return
 	}
+
+	llog.Info("parsed order request body", llog.KV{
+		"handler":          "postOrders",
+		"customer_email":   args.CustomerEmail,
+		"line_items_count": len(args.LineItems),
+	})
 
 	// do some light validation
 	// we could use something like https://pkg.go.dev/gopkg.in/validator.v2
 	// so we could set struct tags but since we only do validation in this one
 	// spot that feels like overkill
 	if !strings.Contains(args.CustomerEmail, "@") {
+		llog.Error("invalid customer email format", llog.KV{"handler": "postOrders"})
 		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidEmail, "invalid customerEmail")
 		return
 	}
 	if len(args.LineItems) < 1 {
+		llog.Error("order has no line items", llog.KV{"handler": "postOrders"})
 		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidLineItems, "an order must contain at least one line item")
 		return
 	}
@@ -275,25 +345,46 @@ func (i *instance) postOrders(c *gin.Context) {
 		Status:        storage.OrderStatusPending,
 	}
 	if order.TotalCents() < 0 {
+		llog.Error("order total is negative", llog.KV{
+			"handler":     "postOrders",
+			"total_cents": order.TotalCents(),
+		})
 		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidTotal, "an order's total cannot be less than 0")
 		return
 	}
 
+	llog.Info("validated order data, inserting into storage", llog.KV{
+		"handler":     "postOrders",
+		"total_cents": order.TotalCents(),
+	})
+
 	id, err := i.stor.InsertOrder(ctx, order)
 	if err != nil {
 		if errors.Is(err, storage.ErrOrderExists) {
+			llog.Error("order already exists", llog.KV{
+				"handler":  "postOrders",
+				"order_id": id,
+			})
 			i.handleError(c, http.StatusConflict, ErrCodeOrderExists, "order already exists")
 		} else {
+			llog.Error("failed to insert order into storage", llog.KV{"handler": "postOrders"}, llog.ErrKV(err))
 			i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error inserting order: %v", err))
 		}
 		return
 	}
 	order.ID = id
 
+	llog.Info("successfully inserted order into storage", llog.KV{
+		"handler":  "postOrders",
+		"order_id": id,
+	})
+
 	// respond with a success and return the order
 	c.JSON(http.StatusCreated, postOrderRes{
 		Order: order,
 	})
+
+	llog.Info("post orders request completed successfully", llog.KV{"handler": "postOrders"})
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -323,12 +414,15 @@ type chargeOrderRes struct {
 
 // chargeOrder is called by incoming HTTP POST requests to /orders/:id/charge
 func (i *instance) chargeOrder(c *gin.Context) {
+	llog.Info("charge order request started", llog.KV{"handler": "chargeOrder"})
+
 	ctx := c.Request.Context()
 
 	// parse the body as JSON into the chargeOrderArgs struct
 	var args chargeOrderArgs
 	err := c.BindJSON(&args)
 	if err != nil {
+		llog.Error("failed to parse JSON body", llog.KV{"handler": "chargeOrder"}, llog.ErrKV(err))
 		i.handleError(c, http.StatusBadRequest, ErrCodeInvalidJSON, fmt.Sprintf("error decoding body: %v", err))
 		return
 	}
@@ -336,21 +430,36 @@ func (i *instance) chargeOrder(c *gin.Context) {
 	// Get order from context (set by middleware)
 	order := i.getOrderFromContext(c)
 
+	llog.Info("retrieved order from context", llog.KV{
+		"handler":      "chargeOrder",
+		"order_id":     order.ID,
+		"order_status": int(order.Status),
+		"amount_cents": order.TotalCents(),
+	})
+
 	if order.Status != storage.OrderStatusPending {
+		llog.Error("order not eligible for charging", llog.KV{
+			"handler":        "chargeOrder",
+			"current_status": int(order.Status),
+		})
 		i.handleError(c, http.StatusConflict, ErrCodeOrderNotEligible,
 			"order ineligible for charging")
 		return
 	}
 
+	llog.Info("calling charge service", llog.KV{"handler": "chargeOrder"})
 	err = i.innerChargeOrder(ctx, chargeServiceChargeArgs{
 		CardToken:   args.CardToken,
 		AmountCents: order.TotalCents(),
 	})
 	if err != nil {
+		llog.Error("charge service failed", llog.KV{"handler": "chargeOrder"}, llog.ErrKV(err))
 		i.handleError(c, http.StatusInternalServerError, ErrCodeChargeServiceError,
 			err.Error())
 		return
 	}
+
+	llog.Info("charge service succeeded, updating order status", llog.KV{"handler": "chargeOrder"})
 
 	// in a real-world scenario we would do a two-phase change where we set it to
 	// charging ahead of time and then mark it as charged after so we would be able
@@ -360,15 +469,20 @@ func (i *instance) chargeOrder(c *gin.Context) {
 	// ignoring this scenario
 	err = i.stor.SetOrderStatus(ctx, order.ID, storage.OrderStatusCharged)
 	if err != nil {
+		llog.Error("failed to update order status to charged", llog.KV{"handler": "chargeOrder"}, llog.ErrKV(err))
 		i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("error updating order to charged: %v", err))
 		return
 	}
+
+	llog.Info("successfully updated order status to charged", llog.KV{"handler": "chargeOrder"})
 
 	// since we successfully charged the order and updated the order status we can
 	// return a success to the caller
 	c.JSON(http.StatusOK, chargeOrderRes{
 		ChargedCents: order.TotalCents(),
 	})
+
+	llog.Info("charge order request completed successfully", llog.KV{"handler": "chargeOrder"})
 }
 
 // innerChargeOrder actually does the charging or refunding (negative amount) by
@@ -415,13 +529,26 @@ type cancelOrderRes struct {
 
 // cancelOrder is called by incoming HTTP POST requests to /orders/:id/cancel
 func (i *instance) cancelOrder(c *gin.Context) {
+	llog.Info("cancel order request started", llog.KV{"handler": "cancelOrder"})
+
 	ctx := c.Request.Context()
 
 	// Get order from context (set by middleware)
 	order := i.getOrderFromContext(c)
 
+	llog.Info("retrieved order from context", llog.KV{
+		"handler":      "cancelOrder",
+		"order_id":     order.ID,
+		"order_status": int(order.Status),
+		"total_cents":  order.TotalCents(),
+	})
+
 	// Check if order can be cancelled (pending or charged orders can be cancelled)
 	if order.Status != storage.OrderStatusPending && order.Status != storage.OrderStatusCharged {
+		llog.Error("order not eligible for cancellation", llog.KV{
+			"handler":        "cancelOrder",
+			"current_status": int(order.Status),
+		})
 		i.handleError(c, http.StatusConflict, ErrCodeOrderNotEligible,
 			"order cannot be cancelled - only pending or charged orders can be cancelled")
 		return
@@ -431,26 +558,36 @@ func (i *instance) cancelOrder(c *gin.Context) {
 
 	// If the order is charged, we need to process a refund
 	if order.Status == storage.OrderStatusCharged {
+		llog.Info("order is charged, processing refund", llog.KV{"handler": "cancelOrder"})
 		// Process refund by charging a negative amount
 		err := i.innerChargeOrder(ctx, chargeServiceChargeArgs{
 			CardToken:   "",                  // In a real implementation, we'd need to store the card token
 			AmountCents: -order.TotalCents(), // Negative amount for refund
 		})
 		if err != nil {
+			llog.Error("refund processing failed", llog.KV{"handler": "cancelOrder"}, llog.ErrKV(err))
 			i.handleError(c, http.StatusInternalServerError, ErrCodeChargeServiceError,
 				fmt.Sprintf("error processing refund: %v", err))
 			return
 		}
 		refundedCents = order.TotalCents()
+		llog.Info("refund processed successfully", llog.KV{
+			"handler":        "cancelOrder",
+			"refunded_cents": refundedCents,
+		})
 	}
 
+	llog.Info("updating order status to cancelled", llog.KV{"handler": "cancelOrder"})
 	// Update order status to cancelled
 	err := i.stor.SetOrderStatus(ctx, order.ID, storage.OrderStatusCancelled)
 	if err != nil {
+		llog.Error("failed to update order status to cancelled", llog.KV{"handler": "cancelOrder"}, llog.ErrKV(err))
 		i.handleError(c, http.StatusInternalServerError, ErrCodeInternalError,
 			fmt.Sprintf("error cancelling order: %v", err))
 		return
 	}
+
+	llog.Info("successfully updated order status to cancelled", llog.KV{"handler": "cancelOrder"})
 
 	// Return success response
 	response := cancelOrderRes{
@@ -464,4 +601,6 @@ func (i *instance) cancelOrder(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response)
+
+	llog.Info("cancel order request completed successfully", llog.KV{"handler": "cancelOrder"})
 }
