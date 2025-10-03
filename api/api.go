@@ -47,6 +47,7 @@ func Handler(stor mocks.StorageInstance, fulfillmentService, chargeService *http
 
 	// set up the various REST endpoints that are exposed publicly over HTTP
 	// go implicitly binds these functions to inst
+	inst.router.GET("/healthz", inst.healthCheck)
 	inst.router.GET("/orders", inst.getOrders)
 	inst.router.POST("/orders", inst.postOrders)
 
@@ -149,6 +150,11 @@ func (i *instance) orderFetchMiddleware() gin.HandlerFunc {
 func (i *instance) getOrderFromContext(c *gin.Context) storage.Order {
 	order, _ := c.Get("order")
 	return order.(storage.Order)
+}
+
+// healthCheck is called by incoming HTTP GET requests to /healthz
+func (i *instance) healthCheck(c *gin.Context) {
+	c.Status(http.StatusOK)
 }
 
 // getOrders is called by incoming HTTP GET requests to /orders
